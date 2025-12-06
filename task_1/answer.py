@@ -1,76 +1,173 @@
-import socket
-import random
+from __future__ import annotations
+
 import math
+import random
+import socket
+from dataclasses import dataclass
+from typing import Final
 
-HOST = "45.67.32.157"
-PORT = 61001
 
-def int_to_str(n: int) -> str:
-    # та же логика, что у сервера
-    return bytes.fromhex(hex(n)[2:]).decode()
+HOST: Final[str] = "45.67.32.157"
+PORT: Final[int] = 61001
+BUFFER_SIZE: Final[int] = 4096
+ENCODING: Final[str] = "utf-8"
 
-def main():
-    s = socket.socket()
-    s.connect((HOST, PORT))
 
-    # накапливаем всё, что пришло, пока не увидим приглашение ввести шифртекст
-    buf = ""
-    while "Ciphertext to decrypt:" not in buf:
-        chunk = s.recv(4096)
-        if not chunk:
-            break
-        buf += chunk.decode(errors="ignore")
+@dataclass
+class RsaChallenge:
+    e: int
+    n: int
+    encrypted_flag: int
 
-    print(buf)  # просто чтобы видеть, что сервер прислал
 
-    # парсим e, N, enc_flag
-    e = N = enc_flag = None
-    for line in buf.splitlines():
-        line = line.strip()
-        if line.startswith("e ="):
-            e = int(line.split("=", 1)[1].strip())
-        elif line.startswith("N ="):
-            N = int(line.split("=", 1)[1].strip())
-        elif line.startswith("Encrypted flag:"):
-            enc_flag = int(line.split(":", 1)[1].strip())
+class RsaOracleClient:
+    def __init__(
+        self,
+        host: str = HOST,
+        port: int = PORT,
+        buffer_size: int = BUFFER_SIZE,
+        encoding: str = ENCODING,
+    ) -> None:
+        self._host: str = host
+        self._port: int = port
+        self._buffer_size: int = buffer_size
+        self._encoding: str = encoding
+        self._socket: socket.socket | None = None
 
-    assert e is not None and N is not None and enc_flag is not None, "Не удалось распарсить e, N, enc_flag"
+    def __enter__(self) -> RsaOracleClient:
+        self._socket = socket.create_connection((self._host, self._port))
+        return self
 
-    # выбираем случайный множитель s, взаимно простой с N
-    while True:
-        s_mul = random.randrange(2, N - 1)
-        if math.gcd(s_mul, N) == 1:
-            break
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self._socket is not None:
+            self._socket.close()
+            self._socket = None
 
-    # C' = enc_flag * s^e mod N
-    C_prime = (enc_flag * pow(s_mul, e, N)) % N
+    @property
+    def encoding(self) -> str:
+        return self._encoding
 
-    print("[*] Отправляю модифицированный шифртекст...")
-    s.sendall(str(C_prime).encode() + b"\n")
+    @property
+    def buffer_size(self) -> int:
+        return self._buffer_size
 
-    # читаем ответ оракула (одного recv обычно хватает, но можно и в цикле)
-    resp = s.recv(4096).decode(errors="ignore")
-    print(resp)
+    def _ensure_socket(self) -> socket.socket:
+        if self._socket is None:
+            raise RuntimeError("Соединение с сервером ещё не установлено")
+        return self._socket
 
-    # парсим "Decrypted message: <число>"
-    dec_value = None
-    for line in resp.splitlines():
-        line = line.strip()
-        if line.startswith("Decrypted message:"):
-            dec_value = int(line.split(":", 1)[1].strip())
-            break
+    def receive_until(self, prompt: str) -> str:
+        sock = self._ensure_socket()
+        parts: list[str] = []
 
-    assert dec_value is not None, "Не удалось распарсить ответ оракула"
+        while True:
+            chunk = sock.recv(self._buffer_size)
+            if not chunk:
+                break
 
-    # dec_value = M * s (mod N) → M = dec_value * s^{-1} mod N
-    s_inv = pow(s_mul, -1, N)   # Python 3.8+
-    m_int = (dec_value * s_inv) % N
-    length = (m_int.bit_length() + 7) // 8
-    flag = m_int.to_bytes(length, byteorder="big")
+            decoded = chunk.decode(self._encoding, errors="ignore")
+            parts.append(decoded)
 
-    print(flag.decode())
+            if prompt in decoded:
+                break
 
-    s.close()
+        return "".join(parts)
+
+    def send_line(self, text: str) -> None:
+        sock = self._ensure_socket()
+        payload = f"{text}\n".encode(self._encoding)
+        sock.sendall(payload)
+
+    def receive_once(self) -> str:
+        sock = self._ensure_socket()
+        data = sock.recv(self._buffer_size)
+        return data.decode(self._encoding, errors="ignore")
+
+
+class RsaPaddingOracleAttacker:
+    def __init__(self, client: RsaOracleClient) -> None:
+        self._client = client
+
+    def execute(self) -> str:
+        banner = self._client.receive_until("Ciphertext to decrypt:")
+        print(banner)
+
+        challenge = self._parse_challenge(banner)
+
+        s_mul = self._choose_random_coprime(challenge.n)
+
+        c_prime = (challenge.encrypted_flag * pow(s_mul, challenge.e, challenge.n)) % challenge.n
+
+        print("[*] Отправляю модифицированный шифртекст...")
+        self._client.send_line(str(c_prime))
+
+        response = self._client.receive_once()
+        print(response)
+
+        dec_value = self._parse_decrypted_message(response)
+
+        plaintext_bytes = self._recover_plaintext(challenge, dec_value, s_mul)
+
+        return plaintext_bytes.decode(self._client.encoding, errors="replace")
+
+    @staticmethod
+    def _parse_challenge(raw_text: str) -> RsaChallenge:
+        e: int | None = None
+        n: int | None = None
+        enc_flag: int | None = None
+
+        for line in raw_text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("e ="):
+                e = int(stripped.split("=", 1)[1].strip())
+            elif stripped.startswith("N ="):
+                n = int(stripped.split("=", 1)[1].strip())
+            elif stripped.startswith("Encrypted flag:"):
+                enc_flag = int(stripped.split(":", 1)[1].strip())
+
+        if e is None or n is None or enc_flag is None:
+            raise ValueError("Не удалось распарсить e, N или encrypted_flag из ответа сервера")
+
+        return RsaChallenge(e=e, n=n, encrypted_flag=enc_flag)
+
+    @staticmethod
+    def _choose_random_coprime(modulus: int) -> int:
+        if modulus <= 3:
+            raise ValueError("Слишком маленький модуль N")
+
+        while True:
+            candidate = random.randrange(2, modulus - 1)
+            if math.gcd(candidate, modulus) == 1:
+                return candidate
+
+    @staticmethod
+    def _parse_decrypted_message(response: str) -> int:
+        for line in response.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Decrypted message:"):
+                return int(stripped.split(":", 1)[1].strip())
+
+        raise ValueError("Не удалось найти строку 'Decrypted message:' в ответе сервера")
+
+    @staticmethod
+    def _recover_plaintext(
+        challenge: RsaChallenge,
+        oracle_decrypted_value: int,
+        multiplier: int,
+    ) -> bytes:
+        s_inv = pow(multiplier, -1, challenge.n)
+        m_int = (oracle_decrypted_value * s_inv) % challenge.n
+
+        length = (m_int.bit_length() + 7) // 8
+        return m_int.to_bytes(length, byteorder="big")
+
+
+def main() -> None:
+    with RsaOracleClient(HOST, PORT) as client:
+        attacker = RsaPaddingOracleAttacker(client)
+        flag = attacker.execute()
+        print(flag)
+
 
 if __name__ == "__main__":
     main()
